@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [3.0.0] — 2026-07-18
+
+### Added — SAML / IDP configuration script
+- **`configure-idp-saml.ps1`** — 13-step automated script that configures Keycloak (Red Hat SSO)
+  as a SAML 2.0 Identity Provider for IBM CPFS 4.x cp-console
+- **Step 2:** Installs `rhsso-operator` via OLM subscription from `redhat-operators` catalog
+- **Step 4:** Creates Keycloak instance CR; waits for `Ready`; retrieves admin credentials
+  from `credential-keycloak` secret automatically
+- **Step 5:** Creates a `KeycloakRealm` CR (`cpfs-realm`) with brute-force protection
+- **Step 6:** Creates a `KeycloakClient` SAML SP (`cpfs-sp`) with ACS URL, SLO URL,
+  email/firstName/lastName/groups attribute mappers, and redirect URIs
+- **Step 7:** Creates test users `saml-admin` and `saml-viewer` with passwords via Keycloak REST API
+- **Step 8:** Creates groups `cpfs-admins` / `cpfs-viewers` and assigns users
+- **Step 9:** Fetches Keycloak SAML metadata XML from the realm descriptor endpoint (with retry loop)
+- **Step 10:** Creates CPFS `IdpConfig` CR with base64-encoded metadata, `nameIdFormat: email`,
+  `mapIdpGroup: true`, `groupsAttribute: groups`
+- **Step 11:** Waits for `IdpConfig` status to become `Enabled/Ready`
+- **Step 12:** Creates `ClusterRoleBinding` mappings:
+  `cpfs-admins` → `icp:cloudpak:administrator`, `cpfs-viewers` → `icp:cloudpak:viewer`
+- **Step 13:** Prints SSO login URL, Keycloak admin console URL, test credentials,
+  and all verification commands
+
+### Added — New script parameters
+- `-RhssoNamespace` — Keycloak namespace (default: `rhsso`)
+- `-RealmName` — Keycloak realm name (default: `cpfs-realm`)
+- `-IdpName` — CPFS IdpConfig CR name (default: `keycloak-saml`)
+- `-AdminUser` / `-AdminPassword` — test admin credentials
+- `-ViewerUser` / `-ViewerPassword` — test viewer credentials
+- `-SkipKeycloak` — skip Steps 2–8 when Keycloak is already running
+
+### Added — README section
+- New `## SAML / IDP Configuration` section with quick start, parameter reference,
+  13-step table, and SAML architecture diagram
+- Updated `## Files in This Repository` to include `configure-idp-saml.ps1`
+
+---
+
 ## [2.0.0] — 2026-07-18
 
 ### Added — Phase 3: cp-console (IAM Stack)
