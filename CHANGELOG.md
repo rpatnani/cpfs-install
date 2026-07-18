@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [4.0.0] — 2026-07-18
+
+### Added — Unified single script
+- **`cpfs-complete-install.ps1`** — merges `install-cpfs-end-to-end.ps1` and
+  `configure-idp-saml.ps1` into a **single 34-step, 4-phase script** that does everything
+  in one command: NFS → CPFS → cp-console → Keycloak SAML SSO
+- **Phase 4** (Steps 22–34) fully integrated into the unified script:
+  Keycloak install, realm, SAML client, test users, groups, IdpConfig CR, role bindings, final summary
+- **New skip flags:** `-SkipSaml` (skip entire Phase 4), `-SkipKeycloak` (skip Keycloak install only)
+- **Final summary banner** (Step 33): prints cp-console URL, SSO login URL, Keycloak admin URL,
+  and test user credentials in one consolidated block
+- **Post-install verification** (Step 34): runs automatically — pods, IdpConfig, Keycloak, events
+- **README updated:** new unified Quick Start, expanded parameter reference table split by phase,
+  Phase 4 step table, updated Files section marking `cpfs-complete-install.ps1` as the primary script
+
+### Retained (for reference / single-phase use)
+- `install-cpfs-end-to-end.ps1` — Phase 1–3 (NFS + CPFS + cp-console), 21 steps
+- `configure-idp-saml.ps1` — Phase 4 (Keycloak + SAML), 13 steps
+
+---
+
 ## [3.0.0] — 2026-07-18
 
 ### Added — SAML / IDP configuration script
