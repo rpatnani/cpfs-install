@@ -15,6 +15,7 @@
 - [What the Script Does](#what-the-script-does)
 - [Skip Flags](#skip-flags)
 - [Post-Install Verification](#post-install-verification)
+- [SAML / IDP Configuration](#saml--idp-configuration)
 - [Troubleshooting](#troubleshooting)
 - [Files in This Repository](#files-in-this-repository)
 - [References](#references)
@@ -254,6 +255,73 @@ https://cp-console-ibm-common-services.apps.<cluster-domain>
 
 ---
 
+## SAML / IDP Configuration
+
+After running `install-cpfs-end-to-end.ps1`, run the companion script to configure
+**Keycloak (Red Hat SSO)** as a SAML Identity Provider for cp-console:
+
+```powershell
+.\configure-idp-saml.ps1 `
+    -ConsoleUrl 'https://console-openshift-console.apps.YOUR-CLUSTER.cp.fyre.ibm.com' `
+    -Password   'YOUR-KUBEADMIN-PASSWORD'
+```
+
+### What the SAML script does (13 steps)
+
+| Step | Action |
+|---|---|
+| 1 | Login to OCP cluster |
+| 2 | Install Red Hat SSO (Keycloak) operator via OLM (`redhat-operators`) |
+| 3 | Wait for `rhsso-operator` pod Running |
+| 4 | Create Keycloak instance CR; wait for `Ready`; retrieve admin credentials |
+| 5 | Create Keycloak Realm (`cpfs-realm`) |
+| 6 | Create SAML Client in the realm (CPFS as Service Provider) with ACS URL, attribute mappers |
+| 7 | Create test users `saml-admin` and `saml-viewer` with passwords |
+| 8 | Create groups `cpfs-admins` / `cpfs-viewers` and assign users |
+| 9 | Fetch Keycloak SAML metadata XML from its descriptor endpoint |
+| 10 | Create CPFS `IdpConfig` CR with the metadata (base64-encoded) |
+| 11 | Wait for `IdpConfig` to become Ready |
+| 12 | Create `ClusterRoleBinding` to map `cpfs-admins` → `ClusterAdministrator`, `cpfs-viewers` → `Viewer` |
+| 13 | Print SSO login URL, Keycloak admin URL, test credentials, and verification commands |
+
+### SAML script parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-ConsoleUrl` | *(required)* | OCP web console URL |
+| `-Password` | *(required)* | OCP kubeadmin password |
+| `-CpConsoleUrl` | *(derived)* | cp-console route URL (derived from ConsoleUrl) |
+| `-Namespace` | `ibm-common-services` | CPFS namespace |
+| `-RhssoNamespace` | `rhsso` | Namespace for Red Hat SSO |
+| `-RealmName` | `cpfs-realm` | Keycloak realm name |
+| `-IdpName` | `keycloak-saml` | CPFS `IdpConfig` CR name |
+| `-AdminUser` | `saml-admin` | Test admin username in Keycloak |
+| `-AdminPassword` | `Admin1234!` | Test admin password |
+| `-ViewerUser` | `saml-viewer` | Test viewer username in Keycloak |
+| `-ViewerPassword` | `Viewer1234!` | Test viewer password |
+| `-SkipKeycloak` | `false` | Skip Keycloak install (Steps 2–8) — use when Keycloak is already running |
+
+### SAML architecture
+
+```
+Browser
+  └─► cp-console (platform-auth-service)
+            │  SAML AuthnRequest
+            ▼
+      Keycloak (rhsso namespace)
+            │  realm: cpfs-realm
+            │  client: cpfs-sp (SAML)
+            │  users: saml-admin, saml-viewer
+            │  SAML Response (signed)
+            ▼
+      platform-auth-service validates assertion
+            │  maps email NameID → CPFS user
+            ▼
+      cp-console dashboard (logged in via SSO)
+```
+
+---
+
 ## Files in This Repository
 
 ```
@@ -261,6 +329,7 @@ cpfs-install/
 ├── README.md                      # This file
 ├── CHANGELOG.md                   # Version history
 ├── install-cpfs-end-to-end.ps1    # Main install script (PowerShell, 21 steps, 3 phases)
+├── configure-idp-saml.ps1         # SAML IDP script — Keycloak + CPFS IdpConfig (13 steps)
 └── preflight-check.js             # Pre-flight check script (Node.js, 8 checks)
 ```
 
