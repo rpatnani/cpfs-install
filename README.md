@@ -1,7 +1,7 @@
 # IBM Cloud Pak Foundational Services (CPFS) 4.x — Automated Installer
 
-> One PowerShell script that provisions NFS storage **and** installs IBM CPFS 4.x
-> on an OpenShift (OCP) cluster running on IBM Fyre — fully automated, no manual steps.
+> One PowerShell script that provisions NFS storage, installs IBM CPFS 4.x, and
+> deploys **cp-console** (IAM) — fully automated, no manual steps required.
 
 ---
 
@@ -13,8 +13,6 @@
 - [Quick Start](#quick-start)
 - [Parameters](#parameters)
 - [What the Script Does](#what-the-script-does)
-  - [Phase 1 — NFS StorageClass](#phase-1--nfs-storageclass)
-  - [Phase 2 — IBM CPFS 4.x](#phase-2--ibm-cpfs-4x)
 - [Skip Flags](#skip-flags)
 - [Post-Install Verification](#post-install-verification)
 - [Troubleshooting](#troubleshooting)
@@ -25,40 +23,52 @@
 
 ## Overview
 
-This project automates the full installation of
+This project automates the **complete** installation of
 [IBM Cloud Pak Foundational Services 4.x](https://www.ibm.com/docs/en/cloud-paks/foundational-services/4.x)
-on an OCP / Fyre cluster, including the NFS StorageClass that CPFS requires.
+on an OCP / Fyre cluster — from bare cluster to a working **cp-console login page** in one command.
 
-**What gets installed:**
+**What gets installed end-to-end:**
 
 | Component | Details |
 |---|---|
 | NFS StorageClass | `nfs-subdir-external-provisioner` on `master0`, set as cluster default |
+| Red Hat cert-manager | `openshift-cert-manager-operator` v1 — required by PostgreSQL and IAM |
 | IBM Operator Catalog | `icr.io/cpopen/ibm-operator-catalog:latest` |
 | CPFS Operator | `ibm-common-service-operator` via OLM subscription |
-| IAM Operator | `ibm-iam-operator` |
-| Licensing Operator | `ibm-licensing-operator` |
-| Cert Manager Operator | `ibm-cert-manager-operator` |
+| ODLM | `operand-deployment-lifecycle-manager` |
+| PostgreSQL | `common-service-db` (EDB Postgres for Kubernetes) |
+| IAM Operator | `ibm-im-operator` |
+| CommonUI Operator | `ibm-idp-config-ui-operator` |
+| Management Ingress | `ibm-management-ingress-operator` |
+| **cp-console** | `common-web-ui` + `platform-auth-service` + `platform-identity-*` |
 
 ---
 
 ## Architecture
 
 ```
-Windows Workstation (PowerShell)
+Windows Workstation (PowerShell 5.1+)
         |
         |  oc login / oc debug / oc apply
         v
-OCP Cluster (Fyre)
-  ├── master0  <-- NFS server (exports /var/data/dynamic)
-  ├── openshift-marketplace
-  │     └── ibm-operator-catalog pod
-  └── ibm-common-services
+OCP Cluster (Fyre / RHCOS)
+  ├── cert-manager-operator namespace
+  │     ├── cert-manager-operator pod
+  │     └── cert-manager / cainjector / webhook pods
+  │
+  ├── managed-nfs-storage namespace
+  │     └── nfs-client-provisioner pod
+  │
+  ├── master0  <-- NFS server (/var/data/dynamic exported)
+  │
+  └── ibm-common-services namespace
         ├── ibm-common-service-operator
         ├── operand-deployment-lifecycle-manager
-        ├── ibm-iam-operator
-        ├── ibm-licensing-operator
-        └── ibm-cert-manager-operator
+        ├── common-service-db-1 / -2  (PostgreSQL)
+        ├── common-web-ui             --> cp-console route
+        ├── platform-auth-service
+        ├── platform-identity-management
+        └── platform-identity-provider
 ```
 
 ---
@@ -68,16 +78,15 @@ OCP Cluster (Fyre)
 | Requirement | Minimum | Notes |
 |---|---|---|
 | Windows PowerShell | 5.1+ | Included in Windows 10/11 |
-| `oc` CLI | 4.10+ | Auto-downloaded by the setup instructions below |
-| Node.js | 18+ | Required for `preflight-check.js` |
-| OCP cluster | 4.10+ | Must have cluster-admin access |
+| `oc` CLI | 4.10+ | See install instructions below |
+| Node.js | 18+ | For `preflight-check.js` |
+| OCP cluster | 4.10+ | Must have cluster-admin |
 | IBM Entitlement Key | — | From [myibm.ibm.com](https://myibm.ibm.com/products-services/containerlibrary) |
-| Internet access | — | To pull `icr.io/cpopen/ibm-operator-catalog` |
+| Internet access | — | Pulls from `icr.io`, `cp.icr.io`, `registry.redhat.io` |
 
 ### Install the oc CLI (Windows, one-time)
 
 ```powershell
-# Download and extract oc.exe to your user profile
 Invoke-WebRequest -Uri "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-windows.zip" `
     -OutFile "$env:TEMP\oc.zip" -UseBasicParsing
 Expand-Archive -Path "$env:TEMP\oc.zip" -DestinationPath "$env:USERPROFILE\.local\bin" -Force
@@ -91,25 +100,19 @@ oc version --client
 
 ```powershell
 # 1. Clone this repository
-git clone https://github.com/YOUR-ORG/cpfs-install.git
+git clone https://github.com/rpatnani/cpfs-install.git
 cd cpfs-install
 
-# 2. Run the installer (supply your own values)
+# 2. Run — everything is automated
 .\install-cpfs-end-to-end.ps1 `
-    -ConsoleUrl    'https://console-openshift-console.apps.YOUR-CLUSTER.cp.fyre.ibm.com' `
-    -Password      'YOUR-KUBEADMIN-PASSWORD' `
+    -ConsoleUrl     'https://console-openshift-console.apps.YOUR-CLUSTER.cp.fyre.ibm.com' `
+    -Password       'YOUR-KUBEADMIN-PASSWORD' `
     -EntitlementKey 'YOUR-IBM-ENTITLEMENT-KEY'
 ```
 
-The script will:
-1. Log in to the cluster
-2. Set up NFS storage on `master0` (no SSH required — uses `oc debug node`)
-3. Deploy the NFS provisioner and smoke-test a PVC
-4. Run pre-flight checks
-5. Install IBM CPFS 4.x end-to-end
-6. Print IAM admin credentials when ready
+The script will print the **cp-console URL** and **initial admin credentials** when done.
 
-**Total runtime:** ~15–25 minutes depending on image pull speed.
+**Total runtime:** ~25–40 minutes.
 
 ---
 
@@ -128,82 +131,108 @@ The script will:
 | `-StorageClass` | `managed-nfs-storage` | StorageClass name to create |
 | `-Namespace` | `ibm-common-services` | Namespace for CPFS operator |
 | `-Channel` | `v4.6` | OLM subscription channel (`v4.3`, `v4.6`, `v4.9`, `v4.10`) |
-| `-Size` | `small` | CommonService size profile (`starterset`, `small`, `medium`, `large`) |
-| `-SkipStorage` | `false` | Skip Phase 1 — use when a StorageClass already exists |
-| `-SkipPreflight` | `false` | Skip the pre-flight check step |
+| `-Size` | `small` | CommonService size: `starterset`, `small`, `medium`, `large` |
+| `-SkipStorage` | `false` | Skip Phase 1 (NFS) — use when StorageClass already exists |
+| `-SkipCertManager` | `false` | Skip cert-manager install — use when already on cluster |
+| `-SkipPreflight` | `false` | Skip pre-flight checks |
+| `-SkipConsole` | `false` | Skip Phase 3 — install CPFS only, without cp-console / IAM |
 
 ---
 
 ## What the Script Does
 
-### Phase 1 — NFS StorageClass
+### Phase 1 — NFS StorageClass (Steps 1–8)
 
 | Step | Action |
 |---|---|
 | 1 | Login to OCP cluster |
-| 2 | Check if a StorageClass already exists (skip if so) |
-| 3 | SSH-free NFS setup via `oc debug node` + `nsenter` on `master0` |
+| 2 | Check if StorageClass already exists (skip if so) |
+| 3 | Configure NFS exports on `master0` via `oc debug node` + `nsenter` (no SSH) |
 | 4 | Discover NFS server internal IP from OCP node object |
-| 5 | Download and apply RBAC, StorageClass, Deployment YAMLs from upstream |
-| 6 | Wait for NFS provisioner pod → Running (up to 3 min) |
-| 7 | Smoke-test: create a PVC, verify Bound, delete it |
+| 5 | Apply RBAC, StorageClass, Deployment from upstream nfs-subdir-external-provisioner |
+| 6 | Wait for NFS provisioner pod Running (up to 3 min) |
+| 7 | Smoke-test: create PVC, verify Bound, delete |
 | 8 | Annotate StorageClass as cluster default |
 
-> **Why `oc debug node` instead of SSH?**
-> RHCOS master nodes use a composefs read-only root filesystem. `nsenter -a -t 1` enters
-> the host's writable mount namespace (`/var`) without needing SSH access from outside the cluster.
+> **Why `oc debug node` instead of SSH?**  
+> RHCOS master nodes use a composefs read-only root. `nsenter -a -t 1` enters the writable
+> host mount namespace without needing SSH access from outside the cluster.
 
-### Phase 2 — IBM CPFS 4.x
+### Phase 2 — IBM CPFS 4.x (Steps 9–17)
 
 | Step | Action |
 |---|---|
-| 9  | Pre-flight checks (8 checks — see `preflight-check.js`) |
-| 10 | Idempotency check — exits cleanly if CPFS already installed |
-| 11 | Create `ibm-common-services` namespace |
-| 12 | Create `ibm-entitlement-key` pull secret in `cp.icr.io` |
-| 13 | Apply `ibm-operator-catalog` CatalogSource; wait for pod Ready (up to 5 min) |
-| 14 | Apply OperatorGroup + Subscription; wait for CSV Succeeded (up to 10 min) |
-| 15 | Apply CommonService CR; wait for phase = Succeeded (up to 20 min) |
+| 9  | Install Red Hat `cert-manager` operator from `redhat-operators` catalog |
+| 10 | Wait for `cert-manager`, `cainjector`, `webhook` pods Running (up to 5 min) |
+| 11 | Pre-flight checks (8 checks — see `preflight-check.js`) |
+| 12 | Idempotency check — skip CPFS install if already present |
+| 13 | Create `ibm-common-services` namespace |
+| 14 | Create `ibm-entitlement-key` pull secret |
+| 15 | Apply `ibm-operator-catalog` CatalogSource; wait for pod Ready (up to 5 min) |
+| 16 | Apply OperatorGroup + Subscription; wait for CSV Succeeded (up to 10 min) |
+| 17 | Apply CommonService CR; wait for phase = Succeeded (up to 20 min) |
+
+> **Why cert-manager first?**  
+> CPFS v4.6 uses PostgreSQL for IAM. The PostgreSQL operator requires `cs-ca-certificate-secret`
+> which is generated by the cert-manager `Issuer` CRD. Without cert-manager installed first,
+> the PostgreSQL cluster CR stays in `Unable to create required cluster objects` indefinitely.
+
+### Phase 3 — cp-console / IAM Stack (Steps 18–21)
+
+| Step | Action |
+|---|---|
+| 18 | Apply `OperandRequest` — triggers ODLM to deploy IAM, CommonUI, PostgreSQL, Management Ingress |
+| 19 | Wait for PostgreSQL cluster `Cluster in healthy state` (up to 10 min); auto-reconcile if stuck |
+| 20 | Wait for `platform-auth-service`, `platform-identity-*`, `common-web-ui` pods Running (up to 15 min) |
+| 21 | Print `cp-console` URL and extract initial IAM admin credentials |
 
 ---
 
 ## Skip Flags
 
 ```powershell
-# StorageClass already exists — skip NFS setup entirely
+# StorageClass already exists
 .\install-cpfs-end-to-end.ps1 -SkipStorage ...
 
-# Cluster already validated — skip pre-flight checks
-.\install-cpfs-end-to-end.ps1 -SkipPreflight ...
+# cert-manager already installed
+.\install-cpfs-end-to-end.ps1 -SkipCertManager ...
 
-# Both — jump straight to CPFS install
-.\install-cpfs-end-to-end.ps1 -SkipStorage -SkipPreflight ...
+# CPFS only — no cp-console / IAM
+.\install-cpfs-end-to-end.ps1 -SkipConsole ...
+
+# Re-run (idempotent) — safe to run again on existing install
+.\install-cpfs-end-to-end.ps1 ...
 ```
-
-The script is **idempotent** — running it again on an already-installed cluster exits cleanly at Step 10.
 
 ---
 
 ## Post-Install Verification
 
-After the script completes, verify the installation:
+After the script completes, verify:
 
 ```bash
-# All pods running
+# 1. All pods Running
 oc get pods -n ibm-common-services
 
-# CommonService phase
+# 2. CommonService Succeeded
 oc get commonservice common-service -n ibm-common-services
 
-# Operand registries
-oc get operandregistry -n ibm-common-services
-oc get operandconfig  -n ibm-common-services
+# 3. PostgreSQL healthy
+oc get cluster -n ibm-common-services
 
-# IAM console route
-oc get route -n ibm-common-services | grep cp-console
+# 4. OperandRequest Running
+oc get operandrequest -n ibm-common-services
 
-# Retrieve initial IAM admin credentials
+# 5. cp-console route
+oc get route cp-console -n ibm-common-services
+
+# 6. IAM admin credentials
 oc extract secret/platform-auth-idp-credentials -n ibm-common-services --to=-
+```
+
+**Expected cp-console URL format:**
+```
+https://cp-console-ibm-common-services.apps.<cluster-domain>
 ```
 
 > **Important:** Change the default `admin` password immediately after first login.
@@ -214,12 +243,14 @@ oc extract secret/platform-auth-idp-credentials -n ibm-common-services --to=-
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `mkdir: cannot create directory '/data': Read-only file system` | RHCOS root fs is read-only | Use `-NfsDir /var/data/dynamic` (default) |
-| `Pre-flight checks failed: No default StorageClass` | Phase 1 was skipped or failed | Run without `-SkipStorage`, or: `oc annotate storageclass <name> storageclass.kubernetes.io/is-default-class=true --overwrite` |
-| CSV stuck in `Installing` | Image pull slow or entitlement key wrong | Check `oc get installplan -n ibm-common-services` and `oc describe pod` for ImagePullBackOff |
-| CommonService stuck in `Updating` | ODLM still deploying operands | Wait — can take up to 20 min. Check: `oc logs -n ibm-common-services -l app.kubernetes.io/name=operand-deployment-lifecycle-manager` |
-| `platform-auth-idp-credentials` secret not found | IAM not yet initialised | Wait ~5 min after CommonService Succeeded, then retry |
-| NFS PVC stuck in `Pending` | NFS server not reachable from pods | Verify firewall rules allow pods to reach the master0 `10.x.x.x` IP on port 2049 |
+| `mkdir: cannot create '/data'` | RHCOS root is read-only | Default NFS dir is `/var/data/dynamic` — already fixed |
+| Pre-flight: No default StorageClass | Phase 1 skipped or failed | Run without `-SkipStorage`, or annotate manually |
+| CSV stuck in `Installing` | Image pull slow / entitlement key wrong | Check `oc get installplan -n ibm-common-services` |
+| PostgreSQL: `Unable to create cluster objects` | cert-manager not installed | Run without `-SkipCertManager`; script installs it automatically |
+| PostgreSQL cluster stuck after cert-manager install | Timing race | Script auto-annotates cluster to trigger reconcile |
+| IAM pods in `CrashLoopBackOff` | PostgreSQL not yet Ready | Wait — pods recover once DB is healthy |
+| `platform-auth-idp-credentials` not found | IAM still initialising | Wait ~5 min after all pods are Running, then retry |
+| cp-console: certificate error in browser | Self-signed cert on Fyre | Click "Proceed anyway" or add cluster CA to browser trust |
 
 ---
 
@@ -229,8 +260,8 @@ oc extract secret/platform-auth-idp-credentials -n ibm-common-services --to=-
 cpfs-install/
 ├── README.md                      # This file
 ├── CHANGELOG.md                   # Version history
-├── install-cpfs-end-to-end.ps1    # Main install script (PowerShell)
-└── preflight-check.js             # Pre-flight check script (Node.js)
+├── install-cpfs-end-to-end.ps1    # Main install script (PowerShell, 21 steps, 3 phases)
+└── preflight-check.js             # Pre-flight check script (Node.js, 8 checks)
 ```
 
 ---
@@ -239,5 +270,6 @@ cpfs-install/
 
 - [IBM CPFS 4.x Documentation](https://www.ibm.com/docs/en/cloud-paks/foundational-services/4.x)
 - [nfs-subdir-external-provisioner](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner)
+- [OpenShift cert-manager Operator](https://docs.openshift.com/container-platform/latest/security/cert_manager_operator/index.html)
 - [OpenShift CLI (oc) Download](https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/)
 - [IBM Entitlement Key](https://myibm.ibm.com/products-services/containerlibrary)
