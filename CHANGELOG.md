@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [5.0.0] — 2026-07-18
+
+### Changed — Aligned to csramapatnani2026 cluster architecture (11 fixes)
+
+#### Fix 1-3 — Parameter defaults updated
+- `-Namespace` default: `ibm-common-services` → **`ibm-operators`**
+- `-Channel` default: `v4.6` → **`v4.19`**
+- `-Size` default: `small` → **`medium`**
+- `-RhssoNamespace` default: `rhsso` → **`ibm-operators`**
+
+#### Fix 4 — CommonService CR fields
+- Added `license.accept: true` (required by CPFS v4.19+)
+- Added `operatorNamespace: ibm-operators`
+- Added `servicesNamespace: ibm-operators`
+- Added `ibm-zen-operator` to services list
+
+#### Fix 5 — IBM cert-manager replaces Red Hat cert-manager
+- Step 9 now installs `ibm-cert-manager-operator` from `ibm-cert-manager-catalog` (channel `v4.2`)
+  in namespace `ibm-cert-manager` instead of `openshift-cert-manager-operator` from `redhat-operators`
+- Step 10 now waits for pods in `ibm-cert-manager` namespace
+
+#### Fix 6 — IBM Zen operator added (Steps 15b)
+- New step 15b: installs `ibm-zen-operator` Subscription (channel `v6.10`) from `ibm-operator-catalog`
+- Required for zen-core, zen-audit, zen-minio, zen-watcher pods on your cluster
+
+#### Fix 7 — ibm-pg-operator added (Step 15c)
+- New step 15c: creates `ibm-pg-operator-catalog` CatalogSource + `ibm-pg-operator` Subscription (channel `v28`)
+- Required for EDB PostgreSQL cluster used by Keycloak (`keycloak-edb-cluster`)
+
+#### Fix 8 — RHBK operator replaces rhsso-operator (Step 22)
+- Step 22 now subscribes to `rhbk-operator` from `redhat-operators` channel `stable-v24`
+  instead of `rhsso-operator` channel `stable`
+- OperatorGroup creation skipped when deploying into `ibm-operators` (already has one)
+
+#### Fix 9 — Keycloak CR updated to RHBK spec (Step 24)
+- API version: `keycloak.org/v1alpha1` → **`k8s.keycloak.org/v2alpha1`**
+- Name: `keycloak` → **`cs-keycloak`** (matches your cluster)
+- Spec: removed `postgresDeploymentSpec`; added EDB backend (`keycloak-edb-cluster-rw`),
+  TLS secret, hostname, proxy headers, token-exchange feature flags (matching your cluster)
+- Instances: 1 → 2
+
+#### Fix 10 — Keycloak admin secret updated (Step 24)
+- Secret name: `credential-keycloak` → **`cs-keycloak-initial-admin`** (RHBK pattern)
+- Secret key: `ADMIN_PASSWORD` → `password` / `username` (RHBK key names)
+
+#### Fix 11 — SAML ACS URL corrected (Step 26)
+- ACS URL: `/ibm/saml20/callback` → **`/ibm/saml20/defaultSP`**
+  (matches the `saml-ui-callback` route present on your cluster)
+
+---
+
 ## [4.0.0] — 2026-07-18
 
 ### Added — Unified single script
