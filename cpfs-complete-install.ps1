@@ -15,11 +15,11 @@
       8.  Mark StorageClass as cluster default
 
     Phase 2 - IBM CPFS 4.x (Steps 9-17)
-      9.  Install Red Hat cert-manager operator (required prereq for cp-console)
-      10. Wait for cert-manager pods Ready
+      9.  Install IBM cert-manager operator from ibm-cert-manager-catalog (required prereq)
+      10. Wait for IBM cert-manager pods Ready
       11. Pre-flight checks
       12. Idempotency check (skip if CPFS already installed)
-      13. Create ibm-common-services namespace
+      13. Create ibm-operators namespace
       14. Create IBM entitlement-key pull secret
       15. Apply IBM Operator CatalogSource + wait for pod Ready
       16. Apply OperatorGroup + Subscription + wait for CSV Succeeded
@@ -32,9 +32,9 @@
       21. Print cp-console URL + extract initial admin credentials
 
     Phase 4 - Keycloak SAML IDP (Steps 22-34)
-      22. Install Red Hat SSO (Keycloak) operator via OLM
-      23. Wait for rhsso-operator pod Running
-      24. Create Keycloak instance CR + wait for Ready
+      22. Install RHBK operator (rhbk-operator) via OLM from redhat-operators channel stable-v24
+      23. Wait for rhbk-operator pod Running
+      24. Create Keycloak instance CR (cs-keycloak, k8s.keycloak.org/v2alpha1) + wait for Ready
       25. Create Keycloak Realm (cpfs-realm)
       26. Create SAML Client in the realm (CPFS as Service Provider)
       27. Create test users in the realm (saml-admin, saml-viewer)
@@ -76,16 +76,17 @@
     StorageClass name to create. Default: managed-nfs-storage
 
 .PARAMETER Namespace
-    CPFS operator namespace. Default: ibm-common-services
+    CPFS operator namespace. Default: ibm-operators
 
 .PARAMETER Channel
-    OLM subscription channel. Default: v4.6
+    OLM subscription channel. Default: v4.19
 
 .PARAMETER Size
-    CommonService size: starterset|small|medium|large. Default: small
+    CommonService size: starterset|small|medium|large. Default: medium
 
 .PARAMETER RhssoNamespace
-    Namespace for Red Hat SSO (Keycloak). Default: rhsso
+    Namespace for RHBK Keycloak operator. Default: ibm-operators
+    (On your cluster Keycloak runs in the same ibm-operators namespace as CPFS)
 
 .PARAMETER RealmName
     Keycloak realm name. Default: cpfs-realm
@@ -170,12 +171,12 @@ param(
     [string]$StorageClass    = 'managed-nfs-storage',
 
     # CPFS
-    [string]$Namespace       = 'ibm-common-services',
-    [string]$Channel         = 'v4.6',
-    [string]$Size            = 'small',
+    [string]$Namespace       = 'ibm-operators',
+    [string]$Channel         = 'v4.19',
+    [string]$Size            = 'medium',
 
     # Keycloak / SAML
-    [string]$RhssoNamespace  = 'rhsso',
+    [string]$RhssoNamespace  = 'ibm-operators',
     [string]$RealmName       = 'cpfs-realm',
     [string]$IdpName         = 'keycloak-saml',
     [string]$AdminUser       = 'saml-admin',
@@ -311,7 +312,7 @@ Write-Info "Cluster       : $ClusterUrl"
 Write-Info "NFS node      : $NfsHost  ($NfsDir)"
 Write-Info "StorageClass  : $StorageClass"
 Write-Info "CPFS namespace: $Namespace  channel: $Channel  size: $Size"
-Write-Info "RHSSO ns      : $RhssoNamespace  realm: $RealmName  idp: $IdpName"
+Write-Info "RHBK ns       : $RhssoNamespace  realm: $RealmName  idp: $IdpName"
 Write-Info "Test users    : $AdminUser / $ViewerUser"
 Write-Info "Skip flags    : Storage=$SkipStorage  CertMgr=$SkipCertManager  Console=$SkipConsole  SAML=$SkipSaml  Keycloak=$SkipKeycloak"
 
@@ -433,53 +434,75 @@ spec:
 # =============================================================================
 Write-Phase 'PHASE 2 -- IBM Cloud Pak Foundational Services 4.x'
 
-# STEP 9 - cert-manager
+# STEP 9 - IBM cert-manager (ibm-cert-manager-operator from ibm-cert-manager-catalog)
+# Your cluster uses IBM cert-manager v4.2 in namespace ibm-cert-manager, NOT Red Hat cert-manager.
 if ($SkipCertManager) {
-    Write-Warn 'SkipCertManager set -- skipping cert-manager install'
+    Write-Warn 'SkipCertManager set -- skipping IBM cert-manager install'
 } else {
-    Write-Step 'STEP 9 -- Red Hat cert-manager operator (prereq for cp-console)'
-    if (& oc get crd certificates.cert-manager.io -o name 2>$null) {
-        Write-Pass 'cert-manager CRDs already present -- skipping install'
+    Write-Step 'STEP 9 -- IBM cert-manager operator (prereq for cp-console)'
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $ibmCmCsv = & oc get csv -n ibm-cert-manager -o jsonpath='{.items[0].metadata.name}' 2>$null
+    $ErrorActionPreference = $prev
+    if ($ibmCmCsv -like 'ibm-cert-manager-operator*') {
+        Write-Pass "IBM cert-manager already installed: $ibmCmCsv"
     } else {
-        & oc create namespace cert-manager-operator --dry-run=client -o yaml | & oc apply -f -
+        # IBM cert-manager uses its own pinned CatalogSource
+        @"
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ibm-cert-manager-catalog
+  namespace: openshift-marketplace
+spec:
+  displayName: ibm-cert-manager-4.2.18
+  image: icr.io/cpopen/ibm-cert-manager-operator-catalog@sha256:latest
+  publisher: IBM
+  sourceType: grpc
+  updateStrategy:
+    registryPoll:
+      interval: 45m
+"@ | & oc apply -f -
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply ibm-cert-manager-catalog CatalogSource.' }
+
+        & oc create namespace ibm-cert-manager --dry-run=client -o yaml | & oc apply -f -
         @"
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
-  name: cert-manager-operator
-  namespace: cert-manager-operator
+  name: ibm-cert-manager-operator-group
+  namespace: ibm-cert-manager
 spec:
-  targetNamespaces: [ cert-manager-operator ]
+  targetNamespaces: [ ibm-cert-manager ]
 "@ | & oc apply -f -
         @"
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
-  name: openshift-cert-manager-operator
-  namespace: cert-manager-operator
+  name: ibm-cert-manager-operator
+  namespace: ibm-cert-manager
 spec:
-  channel: stable-v1
+  channel: v4.2
   installPlanApproval: Automatic
-  name: openshift-cert-manager-operator
-  source: redhat-operators
+  name: ibm-cert-manager-operator
+  source: ibm-cert-manager-catalog
   sourceNamespace: openshift-marketplace
 "@ | & oc apply -f -
-        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply cert-manager Subscription.' }
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply IBM cert-manager Subscription.' }
 
-        Write-Step 'STEP 10 -- Wait for cert-manager pods Ready (up to 5 min)'
+        Write-Step 'STEP 10 -- Wait for IBM cert-manager pods Ready (up to 5 min)'
         $deadline = (Get-Date).AddMinutes(5); $cmReady = $false
         while ((Get-Date) -lt $deadline) {
-            $raw = & oc get pods -n cert-manager -o json 2>$null
+            $raw = & oc get pods -n ibm-cert-manager -o json 2>$null
             if ($raw -and @(($raw | ConvertFrom-Json).items | Where-Object { $_.status.phase -eq 'Running' }).Count -ge 3) {
                 $cmReady = $true; break
             }
-            Write-Info 'Waiting for cert-manager pods...'; Start-Sleep -Seconds 15
+            Write-Info 'Waiting for IBM cert-manager pods...'; Start-Sleep -Seconds 15
         }
         if (-not $cmReady) {
-            & oc get pods -n cert-manager-operator; & oc get pods -n cert-manager
-            throw 'cert-manager pods did not start in time.'
+            & oc get pods -n ibm-cert-manager
+            throw 'IBM cert-manager pods did not start in time.'
         }
-        Write-Pass 'cert-manager pods are Ready'
+        Write-Pass 'IBM cert-manager pods are Ready'
     }
 }
 
@@ -550,12 +573,80 @@ spec:
     if (-not $catReady) { throw 'IBM Operator Catalog pod did not become Ready in time.' }
     Write-Pass 'IBM Operator Catalog pod is Ready'
 
+    # IBM Zen operator — required for Zen UI stack on your cluster
+    Write-Step 'STEP 15b -- IBM Zen operator Subscription'
+    $zenCsv = & oc get csv -n $Namespace -o json 2>$null | ConvertFrom-Json
+    $zenExists = if ($zenCsv -and $zenCsv.items) {
+        @($zenCsv.items | Where-Object { $_.metadata.name -like 'ibm-zen-operator.*' -and $_.status.phase -eq 'Succeeded' }).Count -gt 0
+    } else { $false }
+    if (-not $zenExists) {
+        @"
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ibm-zen-operator
+  namespace: $Namespace
+spec:
+  channel: v6.10
+  installPlanApproval: Automatic
+  name: ibm-zen-operator
+  source: ibm-operator-catalog
+  sourceNamespace: openshift-marketplace
+"@ | & oc apply -f -
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply ibm-zen-operator Subscription.' }
+        Write-Pass 'ibm-zen-operator Subscription applied'
+    } else {
+        Write-Pass 'ibm-zen-operator already installed'
+    }
+
+    # ibm-pg-operator — separate EDB PostgreSQL catalog (used by Keycloak on your cluster)
+    Write-Step 'STEP 15c -- ibm-pg-operator CatalogSource + Subscription'
+    $pgCsv = & oc get csv -n $Namespace -o json 2>$null | ConvertFrom-Json
+    $pgExists = if ($pgCsv -and $pgCsv.items) {
+        @($pgCsv.items | Where-Object { $_.metadata.name -like 'ibm-pg-operator.*' -and $_.status.phase -eq 'Succeeded' }).Count -gt 0
+    } else { $false }
+    if (-not $pgExists) {
+        @"
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ibm-pg-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  displayName: ibm-pg-operator-28.3.2
+  image: icr.io/cpopen/ibm-pg-operator-catalog@sha256:latest
+  publisher: IBM
+  sourceType: grpc
+  updateStrategy:
+    registryPoll:
+      interval: 45m
+"@ | & oc apply -f -
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply ibm-pg-operator-catalog CatalogSource.' }
+        @"
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ibm-pg-operator
+  namespace: $Namespace
+spec:
+  channel: v28
+  installPlanApproval: Automatic
+  name: ibm-pg-operator
+  source: ibm-pg-operator-catalog
+  sourceNamespace: openshift-marketplace
+"@ | & oc apply -f -
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply ibm-pg-operator Subscription.' }
+        Write-Pass 'ibm-pg-operator Subscription applied'
+    } else {
+        Write-Pass 'ibm-pg-operator already installed'
+    }
+
     Write-Step 'STEP 16 -- OperatorGroup + Subscription'
     @"
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
-  name: ibm-common-services-operatorgroup
+  name: ibm-operators-operatorgroup
   namespace: $Namespace
 spec:
   targetNamespaces: [ $Namespace ]
@@ -600,6 +691,10 @@ metadata:
   name: common-service
   namespace: $Namespace
 spec:
+  license:
+    accept: true
+  operatorNamespace: $Namespace
+  servicesNamespace: $Namespace
   size: $Size
   services:
   - name: ibm-iam-operator
@@ -607,6 +702,8 @@ spec:
   - name: ibm-licensing-operator
     spec: {}
   - name: ibm-cert-manager-operator
+    spec: {}
+  - name: ibm-zen-operator
     spec: {}
 "@ | & oc apply -f -
     if ($LASTEXITCODE -ne 0) { throw 'Failed to apply CommonService CR.' }
@@ -732,111 +829,140 @@ if ($SkipSaml) {
         Write-Warn 'SkipKeycloak set -- skipping Keycloak install (Steps 22-28)'
     } else {
 
-        # STEP 22 - Install Red Hat SSO operator
-        Write-Step 'STEP 22 -- Install Red Hat SSO (Keycloak) operator'
+        # STEP 22 - Install RHBK operator (Red Hat Build of Keycloak v24)
+        # Your cluster uses rhbk-operator v24 from redhat-operators channel stable-v24
+        # NOT the old rhsso-operator
+        Write-Step 'STEP 22 -- Install RHBK operator (rhbk-operator, stable-v24)'
         $kcCsv = & oc get csv -n $RhssoNamespace -o json 2>$null | ConvertFrom-Json
         $existingKc = if ($kcCsv -and $kcCsv.items) {
-            @($kcCsv.items | Where-Object { $_.metadata.name -like 'rhsso-operator.*' -and $_.status.phase -eq 'Succeeded' })
+            @($kcCsv.items | Where-Object { $_.metadata.name -like 'rhbk-operator.*' -and $_.status.phase -eq 'Succeeded' })
         } else { @() }
 
         if ($existingKc.Count -gt 0) {
-            Write-Pass "Red Hat SSO operator already installed: $($existingKc[0].metadata.name)"
+            Write-Pass "RHBK operator already installed: $($existingKc[0].metadata.name)"
         } else {
             & oc create namespace $RhssoNamespace --dry-run=client -o yaml | & oc apply -f -
-            @"
+            # Only create OperatorGroup if namespace is dedicated; ibm-operators already has one
+            $ogExists = & oc get operatorgroup -n $RhssoNamespace -o name 2>$null
+            if (-not $ogExists) {
+                @"
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
-  name: rhsso-operator-group
+  name: rhbk-operator-group
   namespace: $RhssoNamespace
 spec:
   targetNamespaces: [ $RhssoNamespace ]
 "@ | & oc apply -f -
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to apply RHSSO OperatorGroup.' }
+            }
             @"
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
-  name: rhsso-operator
+  name: rhbk-operator
   namespace: $RhssoNamespace
 spec:
-  channel: stable
+  channel: stable-v24
   installPlanApproval: Automatic
-  name: rhsso-operator
+  name: rhbk-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
 "@ | & oc apply -f -
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to apply RHSSO Subscription.' }
-            Write-Pass 'RHSSO Subscription applied'
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to apply RHBK Subscription.' }
+            Write-Pass 'RHBK Subscription applied'
 
-            # STEP 23 - Wait for rhsso-operator pod
-            Write-Step 'STEP 23 -- Wait for rhsso-operator pod Running (up to 5 min)'
+            # STEP 23 - Wait for rhbk-operator pod
+            Write-Step 'STEP 23 -- Wait for rhbk-operator pod Running (up to 5 min)'
             $deadline = (Get-Date).AddMinutes(5); $opReady = $false
             while ((Get-Date) -lt $deadline) {
                 $raw = & oc get pods -n $RhssoNamespace -o json 2>$null
                 if ($raw -and @(($raw | ConvertFrom-Json).items | Where-Object {
-                    $_.metadata.name -like 'rhsso-operator*' -and $_.status.phase -eq 'Running'
+                    $_.metadata.name -like 'rhbk-operator*' -and $_.status.phase -eq 'Running'
                 }).Count -ge 1) { $opReady = $true; break }
-                Write-Info 'Waiting for rhsso-operator pod...'; Start-Sleep -Seconds 15
+                Write-Info 'Waiting for rhbk-operator pod...'; Start-Sleep -Seconds 15
             }
-            if (-not $opReady) { & oc get pods -n $RhssoNamespace; throw 'rhsso-operator pod did not start in time.' }
-            Write-Pass 'rhsso-operator pod is Running'
+            if (-not $opReady) { & oc get pods -n $RhssoNamespace; throw 'rhbk-operator pod did not start in time.' }
+            Write-Pass 'rhbk-operator pod is Running'
         }
 
-        # STEP 24 - Create Keycloak instance
-        Write-Step 'STEP 24 -- Create Keycloak instance CR + wait for Ready'
+        # STEP 24 - Create Keycloak instance (RHBK API k8s.keycloak.org/v2alpha1, name cs-keycloak)
+        # Your cluster uses cs-keycloak with EDB PostgreSQL backend (keycloak-edb-cluster)
+        Write-Step 'STEP 24 -- Create Keycloak instance CR (cs-keycloak) + wait for Ready'
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $kcExists = & oc get keycloak keycloak -n $RhssoNamespace -o name 2>$null
+        $kcExists = & oc get keycloak cs-keycloak -n $RhssoNamespace -o name 2>$null
         $ErrorActionPreference = $prev
         if (-not $kcExists) {
             @"
-apiVersion: keycloak.org/v1alpha1
+apiVersion: k8s.keycloak.org/v2alpha1
 kind: Keycloak
 metadata:
-  name: keycloak
+  name: cs-keycloak
   namespace: $RhssoNamespace
 spec:
-  instances: 1
-  externalAccess:
-    enabled: true
-  postgresDeploymentSpec:
-    resources:
-      requests:
-        cpu: 100m
-        memory: 256Mi
+  instances: 2
+  db:
+    vendor: postgres
+    host: keycloak-edb-cluster-rw
+    usernameSecret:
+      name: keycloak-edb-cluster-app
+      key: username
+    passwordSecret:
+      name: keycloak-edb-cluster-app
+      key: password
+  http:
+    tlsSecret: cs-keycloak-tls-secret
+  hostname:
+    hostname: keycloak-$RhssoNamespace.apps.$clusterDomain
+  ingress:
+    enabled: false
+  proxy:
+    headers: xforwarded
+  features:
+    enabled:
+    - token-exchange
+    - admin-fine-grained-authz
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 1Gi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
 "@ | & oc apply -f -
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to create Keycloak instance CR.' }
-            Write-Pass 'Keycloak CR created'
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create cs-keycloak instance CR.' }
+            Write-Pass 'cs-keycloak CR created'
         } else {
-            Write-Pass 'Keycloak CR already exists'
+            Write-Pass 'cs-keycloak CR already exists'
         }
 
         $deadline = (Get-Date).AddMinutes(10); $kcReady = $false
         while ((Get-Date) -lt $deadline) {
             $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-            $kcRaw = & oc get keycloak keycloak -n $RhssoNamespace -o json 2>$null
+            $kcRaw = & oc get keycloak cs-keycloak -n $RhssoNamespace -o json 2>$null
             $ErrorActionPreference = $prev
             if ($kcRaw) {
                 $kc    = $kcRaw | ConvertFrom-Json
                 $ready = ($kc.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' })
                 if ($ready) { $kcReady = $true; break }
-                Write-Info "Keycloak: $(($kc.status.conditions | Where-Object { $_.type -eq 'Ready' } | Select-Object -First 1).message)"
-            } else { Write-Info 'Waiting for Keycloak CR...' }
+                $msg   = ($kc.status.conditions | Where-Object { $_.type -eq 'Ready' } | Select-Object -First 1).message
+                Write-Info "cs-keycloak: $msg"
+            } else { Write-Info 'Waiting for cs-keycloak CR...' }
             Start-Sleep -Seconds 20
         }
-        if (-not $kcReady) { & oc get pods -n $RhssoNamespace; throw 'Keycloak did not become Ready in time.' }
-        Write-Pass 'Keycloak is Ready'
+        if (-not $kcReady) { & oc get pods -n $RhssoNamespace; throw 'cs-keycloak did not become Ready in time.' }
+        Write-Pass 'cs-keycloak is Ready'
 
-        $kcHost = (& oc get keycloak keycloak -n $RhssoNamespace -o jsonpath='{.status.externalURL}' 2>$null).Trim()
-        if (-not $kcHost) {
-            $kcHost = "https://$((& oc get route keycloak -n $RhssoNamespace -o jsonpath='{.spec.host}' 2>$null).Trim())"
-        }
-        $script:KcBaseUrl = $kcHost.TrimEnd('/')
+        # RHBK route is created directly (not via externalURL field)
+        $kcRouteHost = (& oc get route keycloak -n $RhssoNamespace -o jsonpath='{.spec.host}' 2>$null).Trim()
+        $script:KcBaseUrl = "https://$kcRouteHost"
         Write-Pass "Keycloak URL: $script:KcBaseUrl"
 
-        $kcSec   = Invoke-OcJson @('get', 'secret', 'credential-keycloak', '-n', $RhssoNamespace, '-o', 'json')
-        $kcAdminPass = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($kcSec.data.ADMIN_PASSWORD))
-        Write-Pass "Keycloak admin password retrieved from secret 'credential-keycloak'"
+        # RHBK stores initial admin credentials in secret cs-keycloak-initial-admin
+        # (NOT credential-keycloak which was the old rhsso pattern)
+        $kcSec = Invoke-OcJson @('get', 'secret', 'cs-keycloak-initial-admin', '-n', $RhssoNamespace, '-o', 'json')
+        $kcAdminUser = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($kcSec.data.username))
+        $kcAdminPass = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($kcSec.data.password))
+        Write-Pass "Keycloak admin credentials retrieved from secret 'cs-keycloak-initial-admin' (user: $kcAdminUser)"
         $kcToken = Get-KcToken -KcPass $kcAdminPass
         Write-Pass 'Keycloak admin token obtained'
 
@@ -889,9 +1015,10 @@ spec:
         }
 
         # STEP 26 - Create SAML client
+        # ACS URL is /ibm/saml20/defaultSP (matches saml-ui-callback route on your cluster)
         Write-Step 'STEP 26 -- Create SAML Client for CPFS (Service Provider)'
         $spEntityId = "$CpConsoleUrl/ibm/saml20/initiatesso"
-        $acsUrl     = "$CpConsoleUrl/ibm/saml20/callback"
+        $acsUrl     = "$CpConsoleUrl/ibm/saml20/defaultSP"
         Write-Info "SP Entity ID: $spEntityId"
         Write-Info "ACS URL     : $acsUrl"
 
@@ -979,8 +1106,9 @@ spec:
         $kcRouteHost = (& oc get route keycloak -n $RhssoNamespace -o jsonpath='{.spec.host}' 2>$null).Trim()
         if (-not $kcRouteHost) { throw "Keycloak route not found in '$RhssoNamespace'." }
         $script:KcBaseUrl = "https://$kcRouteHost"
-        $kcSec   = Invoke-OcJson @('get', 'secret', 'credential-keycloak', '-n', $RhssoNamespace, '-o', 'json')
-        $kcAdminPass = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($kcSec.data.ADMIN_PASSWORD))
+        # RHBK uses cs-keycloak-initial-admin secret (not credential-keycloak)
+        $kcSec       = Invoke-OcJson @('get', 'secret', 'cs-keycloak-initial-admin', '-n', $RhssoNamespace, '-o', 'json')
+        $kcAdminPass = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($kcSec.data.password))
         Write-Pass "Keycloak URL (existing): $script:KcBaseUrl"
     }
 
