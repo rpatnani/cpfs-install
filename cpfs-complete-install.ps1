@@ -177,12 +177,12 @@ param(
 
     # Keycloak / SAML
     [string]$RhssoNamespace  = 'ibm-operators',
-    [string]$RealmName       = 'cpfs-realm',
+    [string]$RealmName       = 'cloudpak',             # RHBK auto-imports 'cloudpak' realm from cs-keycloak-cloudpak-realm secret
     [string]$IdpName         = 'keycloak-saml',
     [string]$AdminUser       = 'saml-admin',
-    [string]$AdminPassword   = 'Admin1234!',
+    [string]$AdminPassword   = 'SamlAdmin2026@Pass',   # Must satisfy Keycloak password policy (upper+lower+digit+special)
     [string]$ViewerUser      = 'saml-viewer',
-    [string]$ViewerPassword  = 'Viewer1234!',
+    [string]$ViewerPassword  = 'SamlViewer2026@Pass',  # Must satisfy Keycloak password policy
 
     # Skip flags
     [switch]$SkipStorage,
@@ -248,7 +248,8 @@ function Invoke-OcNodeDebug([string]$NodeName, [string]$Command) {
 function Invoke-KeycloakApi {
     param([string]$Method, [string]$Path, [string]$Token,
           [string]$Body = '', [string]$ContentType = 'application/json')
-    $uri = "$script:KcBaseUrl/auth/admin$Path"
+    # IMPORTANT: RHBK uses /admin/realms/... NOT /auth/admin/realms/... (that was old RHSSO)
+    $uri = "$script:KcBaseUrl/admin$Path"
     $h   = @{ Authorization = "Bearer $Token"; Accept = 'application/json' }
     $p   = @{ Uri = $uri; Method = $Method; Headers = $h
               SkipCertificateCheck = $true; TimeoutSec = 30; ErrorAction = 'Stop' }
@@ -1014,58 +1015,72 @@ spec:
             Write-Pass "Realm '$RealmName' already exists"
         }
 
-        # STEP 26 - Create SAML client
-        # ACS URL is /ibm/saml20/defaultSP (matches saml-ui-callback route on your cluster)
-        Write-Step 'STEP 26 -- Create SAML Client for CPFS (Service Provider)'
-        $spEntityId = "$CpConsoleUrl/ibm/saml20/initiatesso"
-        $acsUrl     = "$CpConsoleUrl/ibm/saml20/defaultSP"
-        Write-Info "SP Entity ID: $spEntityId"
-        Write-Info "ACS URL     : $acsUrl"
+        # STEP 26 - Create SAML client in Keycloak for CPFS Liberty as Service Provider
+        # CRITICAL: SP Entity ID and ACS URL must include /idauth/ prefix (Liberty actual paths)
+        # Discovered from Liberty SP metadata at /ibm/saml20/defaultSP/samlmetadata
+        Write-Step 'STEP 26 -- Create SAML Client in Keycloak for CPFS Liberty SP'
+        $spEntityId = "$CpConsoleUrl/idauth/ibm/saml20/defaultSP"
+        $acsUrl     = "$CpConsoleUrl/idauth/ibm/saml20/defaultSP/acs"
+        $sloUrl     = "$CpConsoleUrl/idauth/ibm/saml20/defaultSP/slo"
+        Write-Info "SP Entity ID : $spEntityId"
+        Write-Info "ACS URL      : $acsUrl"
+        Write-Info "SLO URL      : $sloUrl"
 
         $kcToken    = Get-KcToken -KcPass $kcAdminPass
-        $clientBody = @{
-            clientId         = 'cpfs-sp'
-            name             = 'CPFS Service Provider'
-            protocol         = 'saml'
-            enabled          = $true
-            frontchannelLogout = $true
-            fullScopeAllowed = $true
-            redirectUris     = @("$CpConsoleUrl/*")
-            attributes       = @{
-                'saml.authnstatement'   = 'true'
-                'saml.server.signature' = 'true'
-                'saml.force.post.binding' = 'true'
-                'saml.assertion.signature' = 'true'
-                'saml_name_id_format'   = 'email'
-                'saml.client.signature' = 'false'
-                'saml.encrypt'          = 'false'
-                'saml_signature_canonicalization_method' = 'http://www.w3.org/2001/10/xml-exc-c14n#'
-                'saml.assertion.lifespan' = '300'
+        # Check if client already exists (idempotent)
+        $existingClients = Invoke-KeycloakApi -Method GET -Path "/realms/$RealmName/clients" -Token $kcToken
+        $existingClient  = $existingClients | Where-Object { $_.clientId -eq $spEntityId } | Select-Object -First 1
+        if ($existingClient) {
+            Write-Pass "SAML client already exists (id: $($existingClient.id))"
+            $clientInternalId = $existingClient.id
+        } else {
+            $clientBody = @{
+                clientId           = $spEntityId
+                name               = 'cpfs-saml-sp'
+                description        = 'CPFS IAM SAML Service Provider'
+                protocol           = 'saml'
+                enabled            = $true
+                publicClient       = $false
+                frontchannelLogout = $true
+                redirectUris       = @($acsUrl)
+                attributes         = @{
+                    'saml.assertion.signature'               = 'true'
+                    'saml.authnstatement'                    = 'true'
+                    'saml.client.signature'                  = 'false'
+                    'saml.encrypt'                           = 'false'
+                    'saml.force.post.binding'                = 'true'
+                    'saml.server.signature'                  = 'true'
+                    'saml_assertion_consumer_url_post'       = $acsUrl
+                    'saml_assertion_consumer_url_redirect'   = $acsUrl
+                    'saml_single_logout_service_url_post'    = $sloUrl
+                    'saml_single_logout_service_url_redirect' = $sloUrl
+                    'saml.signature.algorithm'               = 'RSA_SHA256'
+                    'saml_name_id_format'                    = 'username'
+                    'saml_force_name_id_format'              = 'false'
+                }
+            } | ConvertTo-Json -Depth 10
+            $null = Invoke-KeycloakApi -Method POST -Path "/realms/$RealmName/clients" -Token $kcToken -Body $clientBody
+            Write-Pass "SAML client '$spEntityId' created"
+            # Get internal ID for mappers
+            $kcToken  = Get-KcToken -KcPass $kcAdminPass
+            $allClients = Invoke-KeycloakApi -Method GET -Path "/realms/$RealmName/clients" -Token $kcToken
+            $clientInternalId = ($allClients | Where-Object { $_.clientId -eq $spEntityId } | Select-Object -First 1).id
+            # Add protocol mappers (email/givenName/lastName/groups)
+            @(
+                @{ name='email';     protocolMapper='saml-user-property-mapper';
+                   config=@{ 'user.attribute'='email';     'attribute.name'='email';     'attribute.nameformat'='Basic'; 'friendly.name'='email' } },
+                @{ name='firstName'; protocolMapper='saml-user-property-mapper';
+                   config=@{ 'user.attribute'='firstName'; 'attribute.name'='givenName'; 'attribute.nameformat'='Basic'; 'friendly.name'='givenName' } },
+                @{ name='lastName';  protocolMapper='saml-user-property-mapper';
+                   config=@{ 'user.attribute'='lastName';  'attribute.name'='lastName';  'attribute.nameformat'='Basic'; 'friendly.name'='lastName' } },
+                @{ name='groups';    protocolMapper='saml-group-membership-mapper';
+                   config=@{ 'attribute.name'='groups'; 'full.path'='false'; 'single.value'='false'; 'attribute.nameformat'='Basic'; 'friendly.name'='groups' } }
+            ) | ForEach-Object {
+                $mapperBody = @{ name=$_.name; protocol='saml'; protocolMapper=$_.protocolMapper; config=$_.config } | ConvertTo-Json -Depth 5
+                $null = Invoke-KeycloakApi -Method POST -Path "/realms/$RealmName/clients/$clientInternalId/protocol-mappers/models" -Token $kcToken -Body $mapperBody
             }
-            protocolMappers  = @(
-                @{ name='email';     protocol='saml'; protocolMapper='saml-user-property-mapper';
-                   config=@{ 'attribute.name'='email';     'attribute.nameformat'='Basic'; 'user.attribute'='email' } },
-                @{ name='firstName'; protocol='saml'; protocolMapper='saml-user-property-mapper';
-                   config=@{ 'attribute.name'='firstName'; 'attribute.nameformat'='Basic'; 'user.attribute'='firstName' } },
-                @{ name='lastName';  protocol='saml'; protocolMapper='saml-user-property-mapper';
-                   config=@{ 'attribute.name'='lastName';  'attribute.nameformat'='Basic'; 'user.attribute'='lastName' } },
-                @{ name='groups';    protocol='saml'; protocolMapper='saml-group-membership-mapper';
-                   config=@{ 'attribute.name'='groups'; 'attribute.nameformat'='Basic'; 'single'='false'; 'full.path'='false' } }
-            )
-        } | ConvertTo-Json -Depth 10
-
-        $null = Invoke-KeycloakApi -Method POST -Path "/realms/$RealmName/clients" -Token $kcToken -Body $clientBody
-        # Patch rootUrl + redirectUris
-        $kcToken = Get-KcToken -KcPass $kcAdminPass
-        $clients = Invoke-KeycloakApi -Method GET -Path "/realms/$RealmName/clients?clientId=cpfs-sp" -Token $kcToken
-        if ($clients -and $clients.Count -gt 0) {
-            $cid = $clients[0].id
-            $upd = $clients[0]
-            $upd.rootUrl = $CpConsoleUrl; $upd.baseUrl = '/ibm/saml20/initiatesso'; $upd.adminUrl = $CpConsoleUrl
-            $upd | Add-Member -MemberType NoteProperty -Name 'redirectUris' -Value @("$CpConsoleUrl/*") -Force
-            $null = Invoke-KeycloakApi -Method PUT -Path "/realms/$RealmName/clients/$cid" -Token $kcToken -Body ($upd | ConvertTo-Json -Depth 10)
+            Write-Pass "Protocol mappers added (email, givenName, lastName, groups)"
         }
-        Write-Pass "SAML client 'cpfs-sp' created and configured"
 
         # STEP 27 - Create test users
         Write-Step 'STEP 27 -- Create test users in Keycloak realm'
@@ -1114,7 +1129,8 @@ spec:
 
     # STEP 29 - Fetch SAML metadata
     Write-Step "STEP 29 -- Fetch Keycloak SAML metadata XML for realm '$RealmName'"
-    $metaUrl = "$script:KcBaseUrl/auth/realms/$RealmName/protocol/saml/descriptor"
+    # IMPORTANT: RHBK metadata URL is /realms/<realm>/... NOT /auth/realms/<realm>/...
+    $metaUrl = "$script:KcBaseUrl/realms/$RealmName/protocol/saml/descriptor"
     Write-Info "Metadata URL: $metaUrl"
     $deadline = (Get-Date).AddMinutes(3); $metaXml = $null
     while ((Get-Date) -lt $deadline) {
@@ -1125,108 +1141,102 @@ spec:
         Start-Sleep -Seconds 10
     }
     if (-not ($metaXml -match 'EntityDescriptor')) { throw "Could not retrieve SAML metadata from $metaUrl" }
-    Write-Pass 'SAML metadata XML retrieved'
-    $metaB64    = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($metaXml))
-    $spEntityId = "$CpConsoleUrl/ibm/saml20/initiatesso"
+    Write-Pass 'Keycloak SAML IDP metadata retrieved'
+    $metaB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($metaXml))
+    Write-Info "Metadata B64 length: $($metaB64.Length)"
 
-    # STEP 30 - Create CPFS IdpConfig CR
-    Write-Step "STEP 30 -- Create CPFS IdpConfig CR: $IdpName"
-    @"
-apiVersion: operator.ibm.com/v1alpha1
-kind: IdpConfig
-metadata:
-  name: $IdpName
-  namespace: $Namespace
-spec:
-  idpType: SAML
-  idpConfig:
-    enabled: true
-    name: $IdpName
-    protocol: SAML
-    type: SAML
-    idp_discovery: true
-    saml:
-      enabled:             true
-      idpMetadata:         $metaB64
-      idpMetadataEncoding: base64
-      entityId:            $spEntityId
-      nameIdFormat:        email
-      signRequest:         false
-      responseIncludesSig: true
-      mapIdpGroup:         true
-      groupsAttribute:     groups
-      userFilter:          ""
-"@ | & oc apply -f -
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to create IdpConfig CR.' }
-    Write-Pass "IdpConfig CR '$IdpName' applied"
+    # STEP 30 - Register Keycloak as SAML IDP in CPFS via POST /v3/auth/idsource
+    # CRITICAL: NOT IdpConfig CRD, NOT /idmgmt/identity/api/v1/directory/idp (CPFS 3.x API)
+    # This is the CPFS 4.x API that:
+    #   1. Writes IDP record to PostgreSQL platformdb
+    #   2. Auto-pushes saml.xml + idpMetadata.xml to all platform-auth-service Liberty pods via JMX
+    #   3. Liberty auto-reloads SAML configuration
+    Write-Step "STEP 30 -- Register Keycloak as SAML IDP in CPFS via /v3/auth/idsource"
+    $authPods = (& oc get pods -n $Namespace -l 'app=platform-auth-service' -o jsonpath='{.items[0].metadata.name}' 2>$null).Trim()
+    if (-not $authPods) { throw "No platform-auth-service pod found in '$Namespace'" }
+    Write-Info "Using pod: $authPods"
 
-    # STEP 31 - Wait for IdpConfig Ready
-    Write-Step 'STEP 31 -- Wait for IdpConfig to become Ready (up to 5 min)'
-    $deadline = (Get-Date).AddMinutes(5); $idpReady = $false
-    while ((Get-Date) -lt $deadline) {
-        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $idpRaw = & oc get idpconfig $IdpName -n $Namespace -o json 2>$null
-        $ErrorActionPreference = $prev
-        if ($idpRaw) {
-            $idpPhase = ($idpRaw | ConvertFrom-Json).status.idpStatus
-            Write-Info "IdpConfig status: $idpPhase"
-            if ($idpPhase -match 'Enabled|Ready|Running') { $idpReady = $true; break }
-        } else { Write-Info 'Waiting for IdpConfig status...' }
-        Start-Sleep -Seconds 15
+    $credSec    = Invoke-OcJson @('get', 'secret', 'platform-auth-idp-credentials', '-n', $Namespace, '-o', 'json')
+    $cpadminPwd = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($credSec.data.admin_password))
+
+    # token_attribute_mappings: maps SAML assertion attributes to CPFS token claims
+    # sub -> NameID (SAML NameID), given_name -> givenName (attribute.name in Keycloak mapper)
+    $idpPayload = @{
+        name        = $IdpName
+        description = 'Keycloak SAML SSO Identity Provider'
+        protocol    = 'saml'
+        type        = 'Keycloak'   # auth_map_v3.saml: ISV|Okta|IBMTDS|AzureAD|Keycloak|Custom|Default
+        jit         = $true        # JIT provisioning: auto-create CPFS users on first SAML login
+        enabled     = $true
+        idp_config  = @{
+            idp_metadata           = $metaB64
+            want_assertions_signed = $true
+            token_attribute_mappings = @{
+                sub         = 'NameID'    # SAML NameID -> CPFS token sub
+                given_name  = 'givenName' # Keycloak firstName mapper attribute.name
+                family_name = 'lastName'  # Keycloak lastName mapper attribute.name
+                groups      = 'groups'    # Keycloak groups mapper attribute.name
+                email       = 'email'     # Keycloak email mapper attribute.name
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    # Encode payload and run inside pod (avoids PowerShell quoting issues with curl)
+    $payloadB64  = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($idpPayload))
+    $samlRegScript = @"
+#!/bin/sh
+TOKEN=`$(curl -sk -X POST https://platform-identity-provider:4300/v1/auth/identitytoken \
+  -d "grant_type=password&username=cpadmin&password=$($cpadminPwd -replace "'","'\\''")&scope=openid" \
+  | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+if [ `${#TOKEN} -lt 100 ]; then echo "ERROR: failed to get token"; exit 1; fi
+EXISTING=`$(curl -sk -H "Authorization: Bearer `$TOKEN" \
+  "https://platform-identity-provider:4300/v3/auth/idsource/?protocol=saml" | grep '"uid"')
+if [ -n "`$EXISTING" ]; then echo "SAML_IDP_EXISTS: `$EXISTING"; exit 0; fi
+PAYLOAD=`$(echo '$payloadB64' | base64 -d)
+RESP=`$(curl -sk -X POST "https://platform-identity-provider:4300/v3/auth/idsource" \
+  -H "Authorization: Bearer `$TOKEN" -H "Content-Type: application/json" \
+  -d "`$PAYLOAD" -w "\nHTTP:%{http_code}")
+echo "SAML_IDP_RESPONSE: `$RESP"
+"@
+
+    $bytes2 = [System.Text.Encoding]::UTF8.GetBytes($samlRegScript.Replace("`r`n","`n"))
+    $b64reg  = [Convert]::ToBase64String($bytes2)
+    $prev    = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $samlOut = (& oc exec -n $Namespace $authPods -- sh -c "echo '$b64reg' | base64 -d > /tmp/_saml_reg.sh && sh /tmp/_saml_reg.sh" 2>&1) -join "`n"
+    $ErrorActionPreference = $prev
+    Write-Info $samlOut
+    if ($samlOut -match 'SAML_IDP_EXISTS') {
+        Write-Pass "SAML IDP '$IdpName' already registered (idempotent)"
+    } elseif ($samlOut -match '"status":"success"' -or $samlOut -match 'HTTP:200') {
+        Write-Pass "SAML IDP '$IdpName' registered successfully"
+    } else {
+        Write-Warn "SAML IDP registration response: $samlOut -- check platform-identity-provider logs"
     }
-    if (-not $idpReady) { Write-Warn 'IdpConfig may still be initialising -- continuing' }
-    else                { Write-Pass "IdpConfig '$IdpName' is Ready" }
 
-    # STEP 32 - Map groups to CPFS roles
-    Write-Step 'STEP 32 -- Map Keycloak groups to CPFS roles'
-    @"
-apiVersion: user.openshift.io/v1
-kind: Group
-metadata:
-  name: cpfs-admins
-  annotations:
-    icp.ibm.com/type: SAML
-    icp.ibm.com/idp: $IdpName
-users: []
----
-apiVersion: user.openshift.io/v1
-kind: Group
-metadata:
-  name: cpfs-viewers
-  annotations:
-    icp.ibm.com/type: SAML
-    icp.ibm.com/idp: $IdpName
-users: []
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: cpfs-saml-admins-binding
-subjects:
-- kind: Group
-  name: cpfs-admins
-  apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: ClusterRole
-  name: icp:cloudpak:administrator
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: cpfs-saml-viewers-binding
-subjects:
-- kind: Group
-  name: cpfs-viewers
-  apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: ClusterRole
-  name: icp:cloudpak:viewer
-  apiGroup: rbac.authorization.k8s.io
-"@ | & oc apply -f -
-    if ($LASTEXITCODE -ne 0) { Write-Warn 'ClusterRoleBinding apply had warnings -- check manually' }
-    Write-Pass "cpfs-admins  --> ClusterRole 'icp:cloudpak:administrator'"
-    Write-Pass "cpfs-viewers --> ClusterRole 'icp:cloudpak:viewer'"
+    # STEP 31 - Verify Liberty SAML config was auto-pushed
+    Write-Step 'STEP 31 -- Verify Liberty SAML config (saml.xml + idpMetadata.xml)'
+    $prev    = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $verOut  = (& oc exec -n $Namespace $authPods -- sh -c "ls /opt/ibm/wlp/usr/servers/defaultServer/configDropins/defaults/ && ls /opt/ibm/wlp/usr/servers/defaultServer/resources/security/ 2>/dev/null" 2>&1) -join ' '
+    $ErrorActionPreference = $prev
+    Write-Info "Liberty configDropins: $verOut"
+    if ($verOut -match 'saml.xml')         { Write-Pass 'Liberty saml.xml present (SAML feature active)' }
+    else                                   { Write-Warn 'saml.xml not yet present -- wait 30s and check configDropins' }
+    if ($verOut -match 'idpMetadata.xml')  { Write-Pass 'idpMetadata.xml present (Keycloak IDP metadata uploaded)' }
+    else                                   { Write-Warn 'idpMetadata.xml not yet present' }
+
+    # STEP 32 - Verify SAML IDP in idsource
+    Write-Step 'STEP 32 -- Verify SAML IDP in /v3/auth/idsource'
+    $prev    = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $idpOut  = (& oc exec -n $Namespace $authPods -- sh -c "
+TOKEN=`$(curl -sk -X POST https://platform-identity-provider:4300/v1/auth/identitytoken \
+  -d 'grant_type=password&username=cpadmin&password=$($cpadminPwd -replace "'","'\\''")&scope=openid' \
+  | sed 's/.*\"access_token\":\"\([^\"]*\)\".*/\1/')
+curl -sk -H \"Authorization: Bearer `$TOKEN\" \
+  'https://platform-identity-provider:4300/v3/auth/idsource/?protocol=saml'" 2>&1) -join "`n"
+    $ErrorActionPreference = $prev
+    Write-Info $idpOut
+    if ($idpOut -match '"protocol":"saml"') { Write-Pass "SAML IDP '$IdpName' confirmed in idsource" }
+    else                                   { Write-Warn "SAML IDP not confirmed -- check platform-identity-provider" }
 
 } # end if -not SkipSaml
 
@@ -1261,9 +1271,10 @@ Write-Host "    Login (native) : admin / (see secret platform-auth-idp-credentia
 if (-not $SkipSaml) {
     Write-Host ''
     Write-Host '  Keycloak SAML SSO:' -ForegroundColor Cyan
-    Write-Host "    Admin console  : $script:KcBaseUrl/auth/admin" -ForegroundColor White
+    Write-Host "    Admin console  : $script:KcBaseUrl/admin" -ForegroundColor White
     Write-Host "    Realm          : $RealmName" -ForegroundColor White
-    Write-Host "    SSO login URL  : $CpConsoleUrl/ibm/saml20/initiatesso" -ForegroundColor Green
+    Write-Host "    IDP metadata   : $script:KcBaseUrl/realms/$RealmName/protocol/saml/descriptor" -ForegroundColor White
+    Write-Host "    SAML SSO test  : Open cp-console -> select 'Enterprise SAML' -> Continue" -ForegroundColor Green
     Write-Host ''
     Write-Host '  SAML Test Users:' -ForegroundColor Cyan
     Write-Host "    $AdminUser  / $AdminPassword" -ForegroundColor White
@@ -1329,4 +1340,4 @@ $ErrorActionPreference = $prev
 if ($warnEvents) { $warnEvents | Select-Object -Last 10 | ForEach-Object { Write-Warn $_ } }
 else             { Write-Pass 'No Warning events' }
 
-Write-Pass 'All done.'
+Write-Pass 'All done. v5.0.0'

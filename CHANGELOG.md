@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [5.0.0] — 2026-07-19 (VERIFIED END-TO-END)
+
+### SAML SSO Verified
+Full Keycloak SAML SSO flow tested end-to-end on OCP 4.22 / CPFS 4.19 / RHBK 24:
+- User selects "Enterprise SAML" on cp-console login page
+- Browser redirected to Keycloak `cloudpak` realm  
+- User authenticates with Keycloak credentials
+- JIT provisioned as `keycloak-user1` in CPFS IAM
+- Logged into cp-console as `keycloak-user1`
+
+### Critical Fixes (Phase 4 SAML)
+
+#### Fix A — SAML IDP Config API (was completely wrong)
+- **Before**: Used non-existent `IdpConfig` CRD
+- **After**: `POST https://platform-identity-provider:4300/v3/auth/idsource`
+  - Payload: `{protocol: "saml", type: "Keycloak", jit: true, idp_config: {idp_metadata: <b64>}}`
+  - `type` must be `"Keycloak"` (from `auth_map_v3.saml` in `cloudpak_ibmid_util.js`)
+  - Liberty `saml.xml` + `idpMetadata.xml` auto-pushed to all `platform-auth-service` pods
+
+#### Fix B — RHBK Keycloak API paths
+- **Before**: `/auth/admin/realms/...` (old RHSSO path)
+- **After**: `/admin/realms/...` (RHBK path)
+- Token endpoint: `/realms/master/protocol/openid-connect/token`
+- Metadata URL: `/realms/cloudpak/protocol/saml/descriptor`
+
+#### Fix C — Realm name
+- **Before**: `cpfs-realm` (manually created via KeycloakRealm CRD)
+- **After**: `cloudpak` (auto-imported from `cs-keycloak-cloudpak-realm` secret)
+
+#### Fix D — SAML SP Entity ID and ACS URL
+- **Before**: `https://<cp-console>/ibm/saml20/defaultSP`
+- **After**: `https://<cp-console>/idauth/ibm/saml20/defaultSP`
+- ACS URL: `https://<cp-console>/idauth/ibm/saml20/defaultSP/acs`
+
+#### Fix E — Test user passwords
+- Keycloak password policy requires strong passwords
+- Defaults: `SamlAdmin2026@Pass`, `SamlViewer2026@Pass`
+
+---
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+---
+
 ## [5.0.0] â€” 2026-07-18
 
 ### Changed â€” Aligned to csramapatnani2026 cluster architecture (11 fixes)
